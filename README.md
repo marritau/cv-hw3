@@ -1,8 +1,7 @@
 # DETR Fine-tuning on COCO-subset
 
-Минимальный проект для HW3: fine-tuning настоящего предобученного DETR
-`facebook/detr-resnet-50` на COCO-subset из 10 классов. Структура специально
-упрощена: вся основная логика лежит в одном файле, а запуск — через один CLI.
+fine-tuning настоящего предобученного DETR
+`facebook/detr-resnet-50` на COCO-subset из 10 классов.
 
 ## Структура
 
@@ -11,14 +10,11 @@
 ├── prepare_coco_subset.py   # фильтрация COCO до 10 классов
 ├── requirements.txt
 ├── src/
-│   ├── minidetr.py          # dataset, HF DETR, MiniDETR, metrics, plots, errors
+│   ├── detr.py              # dataset, HF DETR, metrics, plots, errors
 │   └── train.py             # команды train/eval/plot/errors
 └── tests/
     └── test_core.py
 ```
-
-После запуска сами появятся папки `data/`, `runs/`, `checkpoints/`,
-`profiler_traces/`, `reports/`, `outputs/`. Их не надо хранить пустыми в проекте.
 
 ## Что внутри
 
@@ -27,9 +23,10 @@
   `ignore_mismatched_sizes=True`.
 - Hugging Face DETR внутри использует Hungarian matching и DETR loss:
   classification + L1 bbox + GIoU.
-- Дополнительный учебный режим `--model-type mini` оставлен для самодельного
-  MiniDETR из лекционных фрагментов, но основной результат для сдачи нужно
-  получать через `--model-type hf-detr`.
+- Для backbone используется отдельный learning rate `1e-5`, для остальных
+  параметров — `1e-4`.
+- Scheduler: `StepLR` с `lr_drop=10`.
+- Train preprocessing: resize по максимальной стороне и horizontal flip.
 - TensorBoard logs.
 - Checkpoints `last.pt` и `best.pt`.
 - Profiler trace.
@@ -40,13 +37,16 @@
 ## Локальный запуск
 
 ```bash
+python --version
 pip install -r requirements.txt
 
 python prepare_coco_subset.py ^
   --coco-root D:\datasets\coco ^
   --out-root data/coco_10cls ^
   --max-train-images 3000 ^
-  --max-val-images 500
+  --max-val-images 500 ^
+  --min-train-instances-per-class 50 ^
+  --min-val-instances-per-class 10
 
 python -m src.train train ^
   --train-images data/coco_10cls/train2017 ^
@@ -55,16 +55,16 @@ python -m src.train train ^
   --val-annotations data/coco_10cls/annotations/instances_val2017_10cls.json ^
   --epochs 20 ^
   --batch-size 2 ^
-  --model-type hf-detr ^
+  --lr 1e-4 ^
+  --lr-backbone 1e-5 ^
+  --metric-score-threshold 0.0 ^
   --profile
 ```
 
 ## Полный прогон в Kaggle
 
 Ниже команды именно для ячеек Kaggle Notebook, поэтому везде стоят `!`.
-Путь `COCO_ROOT` поменяй под свой Kaggle Dataset. Обычно он выглядит примерно
-как `/kaggle/input/coco-2017-dataset/coco2017`, но у разных датасетов имя может
-отличаться.
+Путь `COCO_ROOT` менять под Kaggle Dataset. 
 
 ### 1. Проверить файлы датасета
 
@@ -77,18 +77,19 @@ python -m src.train train ^
 ### 2. Установить зависимости
 
 ```python
+!python --version
 !pip install -q -r requirements.txt
 ```
 
-Для скачивания `facebook/detr-resnet-50` в Kaggle должен быть включен Internet.
+Код рассчитан на Python `>=3.10`. Для загрузки `facebook/detr-resnet-50`
+в Kaggle должен быть включен Internet.
 
 ### 3. Задать путь к COCO
 
+(пример)
 ```python
 COCO_ROOT = "/kaggle/input/coco-2017-dataset/coco2017"
 ```
-
-Если предыдущая проверка показала другой путь, замени строку выше.
 
 ### 4. Собрать COCO-subset из 10 классов
 
@@ -98,6 +99,8 @@ COCO_ROOT = "/kaggle/input/coco-2017-dataset/coco2017"
   --out-root /kaggle/working/data/coco_10cls \
   --max-train-images 3000 \
   --max-val-images 500 \
+  --min-train-instances-per-class 50 \
+  --min-val-instances-per-class 10 \
   --link-mode copy
 ```
 
@@ -114,8 +117,11 @@ COCO_ROOT = "/kaggle/input/coco-2017-dataset/coco2017"
   --epochs 20 \
   --batch-size 2 \
   --num-workers 2 \
-  --model-type hf-detr \
   --pretrained-model facebook/detr-resnet-50 \
+  --lr 1e-4 \
+  --lr-backbone 1e-5 \
+  --lr-drop 10 \
+  --metric-score-threshold 0.0 \
   --output-dir /kaggle/working \
   --profile
 ```
@@ -131,8 +137,8 @@ COCO_ROOT = "/kaggle/input/coco-2017-dataset/coco2017"
   --epochs 1 \
   --batch-size 2 \
   --num-workers 2 \
-  --model-type hf-detr \
   --limit-train-batches 10 \
+  --metric-score-threshold 0.0 \
   --output-dir /kaggle/working \
   --profile
 ```
@@ -155,7 +161,8 @@ COCO_ROOT = "/kaggle/input/coco-2017-dataset/coco2017"
   --predictions /kaggle/working/outputs/predictions.json \
   --batch-size 2 \
   --num-workers 2 \
-  --metric-backend coco
+  --metric-backend coco \
+  --metric-score-threshold 0.0
 ```
 
 ### 8. Построить график loss
@@ -178,6 +185,9 @@ COCO_ROOT = "/kaggle/input/coco-2017-dataset/coco2017"
   --batch-size 2 \
   --num-workers 2 \
   --metric-backend coco \
+  --metric-score-threshold 0.0 \
+  --error-score-threshold 0.3 \
+  --visual-score-threshold 0.5 \
   --max-visuals 16
 ```
 
@@ -188,33 +198,4 @@ COCO_ROOT = "/kaggle/input/coco-2017-dataset/coco2017"
 !ls -R /kaggle/working/reports
 !ls -R /kaggle/working/profiler_traces | head
 !ls -R /kaggle/working/outputs | head -50
-```
-
-## Что сдавать
-
-- Код: `src/minidetr.py`, `src/train.py`, `prepare_coco_subset.py`.
-- TensorBoard logs: `runs/`.
-- Checkpoints: `checkpoints/best.pt`, `checkpoints/last.pt`.
-- Profiler trace: `profiler_traces/`.
-- Таблица метрик: `reports/metrics.csv` и/или `reports/eval_metrics.json`.
-- График потерь: `outputs/plots/losses.png`.
-- Визуализации и разбор ошибок: `outputs/visualizations/`,
-  `outputs/error_analysis/errors.json`.
-
-## Если нужно запустить именно учебный MiniDETR
-
-Это не основной вариант для сдачи, потому что он обучается с нуля и не является
-fine-tuning предобученного DETR. Но он оставлен как компактная реализация идей из
-лекций:
-
-```python
-!python -m src.train train \
-  --train-images /kaggle/working/data/coco_10cls/train2017 \
-  --train-annotations /kaggle/working/data/coco_10cls/annotations/instances_train2017_10cls.json \
-  --val-images /kaggle/working/data/coco_10cls/val2017 \
-  --val-annotations /kaggle/working/data/coco_10cls/annotations/instances_val2017_10cls.json \
-  --model-type mini \
-  --epochs 1 \
-  --limit-train-batches 10 \
-  --output-dir /kaggle/working
 ```

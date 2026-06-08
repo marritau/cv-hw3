@@ -3,6 +3,7 @@ import json
 import os
 import random
 import shutil
+import csv
 from pathlib import Path
 
 
@@ -22,8 +23,9 @@ DEFAULT_CLASSES = [
 
 def parse_classes(value: str | None) -> list[str]:
     if not value:
-        return DEFAULT_CLASSES
-    return [item.strip() for item in value.split(",") if item.strip()]
+        return list(DEFAULT_CLASSES)
+    class_names = [item.strip() for item in value.split(",") if item.strip()]
+    return list(dict.fromkeys(class_names))
 
 
 def copy_or_link(src: Path, dst: Path, mode: str):
@@ -33,16 +35,38 @@ def copy_or_link(src: Path, dst: Path, mode: str):
     if mode == "copy":
         shutil.copy2(src, dst)
     elif mode == "hardlink":
-        os.link(src, dst)
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)
     else:
         raise ValueError(f"Unknown link mode: {mode}")
 
 
-def filter_split(coco_root: Path, out_root: Path, split: str, class_names: list[str], max_images: int | None, seed: int, link_mode: str):
+def save_distribution(path: Path, class_counts: dict[str, int]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["class_name", "instances"])
+        writer.writeheader()
+        for class_name, count in class_counts.items():
+            writer.writerow({"class_name": class_name, "instances": count})
+
+
+def filter_split(
+    coco_root: Path,
+    out_root: Path,
+    split: str,
+    class_names: list[str],
+    max_images: int | None,
+    min_instances_per_class: int,
+    seed: int,
+    link_mode: str,
+):
     ann_path = coco_root / "annotations" / f"instances_{split}.json"
     image_src_dir = coco_root / split
     image_out_dir = out_root / split
-    out_ann_path = out_root / "annotations" / f"instances_{split}_10cls.json"
+    suffix = f"{len(class_names)}cls"
+    out_ann_path = out_root / "annotations" / f"instances_{split}_{suffix}.json"
 
     with ann_path.open("r", encoding="utf-8") as f:
         coco = json.load(f)
@@ -67,7 +91,7 @@ def filter_split(coco_root: Path, out_root: Path, split: str, class_names: list[
         images.sort(key=lambda img: int(img["id"]))
 
     image_ids = {int(img["id"]) for img in images}
-    annotations = [ann for img_id in image_ids for ann in anns_by_image[img_id]]
+    annotations = [ann for img_id in sorted(image_ids) for ann in anns_by_image[img_id]]
     categories = [name_to_cat[name] for name in class_names]
     cat_id_to_name = {int(cat["id"]): cat["name"] for cat in categories}
     class_counts = {name: 0 for name in class_names}
@@ -75,10 +99,10 @@ def filter_split(coco_root: Path, out_root: Path, split: str, class_names: list[
         name = cat_id_to_name[int(ann["category_id"])]
         class_counts[name] += 1
 
-    missing_after_sampling = [name for name, count in class_counts.items() if count == 0]
+    missing_after_sampling = [name for name, count in class_counts.items() if count < min_instances_per_class]
     if missing_after_sampling:
         raise RuntimeError(
-            f"{split}: after sampling these classes have zero objects: {missing_after_sampling}. "
+            f"{split}: after sampling these classes have fewer than {min_instances_per_class} objects: {missing_after_sampling}. "
             "Increase --max-train-images/--max-val-images or choose another class list."
         )
 
@@ -101,6 +125,7 @@ def filter_split(coco_root: Path, out_root: Path, split: str, class_names: list[
     print(f"{split}: {len(images)} images, {len(annotations)} boxes -> {out_ann_path}")
     for name, count in class_counts.items():
         print(f"  {name}: {count}")
+    save_distribution(out_root / "annotations" / f"class_distribution_{split}.csv", class_counts)
 
 
 def main():
@@ -110,16 +135,36 @@ def main():
     parser.add_argument("--classes", default=None, help="Comma-separated COCO class names.")
     parser.add_argument("--max-train-images", type=int, default=3000)
     parser.add_argument("--max-val-images", type=int, default=500)
+    parser.add_argument("--min-train-instances-per-class", type=int, default=50)
+    parser.add_argument("--min-val-instances-per-class", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--link-mode", choices=["copy", "hardlink", "none"], default="copy")
     args = parser.parse_args()
 
     class_names = parse_classes(args.classes)
     if len(class_names) < 10:
-        raise ValueError("The homework requires at least 10 classes.")
+        raise ValueError("The homework requires at least 10 unique classes.")
     coco_root, out_root = Path(args.coco_root), Path(args.out_root)
-    filter_split(coco_root, out_root, "train2017", class_names, args.max_train_images, args.seed, args.link_mode)
-    filter_split(coco_root, out_root, "val2017", class_names, args.max_val_images, args.seed, args.link_mode)
+    filter_split(
+        coco_root,
+        out_root,
+        "train2017",
+        class_names,
+        args.max_train_images,
+        args.min_train_instances_per_class,
+        args.seed,
+        args.link_mode,
+    )
+    filter_split(
+        coco_root,
+        out_root,
+        "val2017",
+        class_names,
+        args.max_val_images,
+        args.min_val_instances_per_class,
+        args.seed,
+        args.link_mode,
+    )
 
 
 if __name__ == "__main__":

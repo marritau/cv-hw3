@@ -6,12 +6,9 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.minidetr import (
+from src.detr import (
     CocoDetectionSubset,
     HFDetr,
-    HungarianMatcher,
-    MiniDETR,
-    SetCriterion,
     analyze_errors,
     append_metrics_row,
     batch_to_predictions,
@@ -30,6 +27,8 @@ from src.minidetr import (
 
 
 def build_loaders(args, class_names: list[str]):
+    pin_memory = args.device.startswith("cuda")
+    persistent_workers = args.num_workers > 0
     train_loader = None
     if getattr(args, "train_images", None):
         train_set = CocoDetectionSubset(
@@ -37,6 +36,8 @@ def build_loaders(args, class_names: list[str]):
             args.train_annotations,
             class_names=class_names,
             max_size=args.max_size,
+            train=True,
+            hflip_prob=args.hflip_prob,
         )
         train_loader = DataLoader(
             train_set,
@@ -44,6 +45,8 @@ def build_loaders(args, class_names: list[str]):
             shuffle=True,
             num_workers=args.num_workers,
             collate_fn=collate_fn,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
         )
 
     val_set = CocoDetectionSubset(
@@ -51,6 +54,7 @@ def build_loaders(args, class_names: list[str]):
         args.val_annotations,
         class_names=class_names,
         max_size=args.max_size,
+        train=False,
     )
     val_loader = DataLoader(
         val_set,
@@ -58,101 +62,148 @@ def build_loaders(args, class_names: list[str]):
         shuffle=False,
         num_workers=args.num_workers,
         collate_fn=collate_fn,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
     )
     return train_loader, val_loader
 
 
-def build_model_and_loss(args, class_names: list[str], device: torch.device):
-    if args.model_type == "hf-detr":
-        model = HFDetr(
-            num_classes=len(class_names),
-            class_names=class_names,
-            pretrained_model=args.pretrained_model,
-            hf_config=getattr(args, "hf_config", None),
-        ).to(device)
-        criterion = None
-    else:
-        model = MiniDETR(
-            num_classes=len(class_names),
-            num_queries=args.num_queries,
-            d_model=args.d_model,
-            nhead=args.nhead,
-            enc_layers=args.enc_layers,
-            dec_layers=args.dec_layers,
-            dim_ff=args.dim_ff,
-            dropout=args.dropout,
-        ).to(device)
-        criterion = SetCriterion(
-            num_classes=len(class_names),
-            matcher=HungarianMatcher(args.cost_class, args.cost_bbox, args.cost_giou),
-            eos_coef=args.eos_coef,
-        ).to(device)
-    return model, criterion
+def build_model(args, class_names: list[str], device: torch.device):
+    model = HFDetr(
+        num_classes=len(class_names),
+        class_names=class_names,
+        pretrained_model=args.pretrained_model,
+        local_pretrained_dir=getattr(args, "local_pretrained_dir", None),
+    )
+    return model.to(device)
+
+
+def build_optimizer(model, args):
+    backbone_params, other_params = [], []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if "backbone" in name:
+            backbone_params.append(parameter)
+        else:
+            other_params.append(parameter)
+
+    return torch.optim.AdamW(
+        [
+            {"params": other_params, "lr": args.lr},
+            {"params": backbone_params, "lr": args.lr_backbone},
+        ],
+        weight_decay=args.weight_decay,
+    )
 
 
 def model_config_from_args(args, class_names: list[str]):
     return {
-        "model_type": args.model_type,
         "pretrained_model": args.pretrained_model,
         "num_classes": len(class_names),
-        "num_queries": args.num_queries,
-        "d_model": args.d_model,
-        "nhead": args.nhead,
-        "enc_layers": args.enc_layers,
-        "dec_layers": args.dec_layers,
-        "dim_ff": args.dim_ff,
-        "dropout": args.dropout,
-        "cost_class": args.cost_class,
-        "cost_bbox": args.cost_bbox,
-        "cost_giou": args.cost_giou,
-        "eos_coef": args.eos_coef,
     }
 
 
-def apply_model_config(args, config: dict):
-    for key, value in config.items():
-        setattr(args, key, value)
+def data_config_from_args(args, class_names: list[str]):
+    return {
+        "class_names": class_names,
+        "max_size": args.max_size,
+        "train_annotations": getattr(args, "train_annotations", None),
+        "val_annotations": args.val_annotations,
+    }
 
 
-def save_checkpoint(path: str | Path, model, optimizer, epoch: int, metrics: dict, model_config: dict, class_names: list[str], best_map50: float):
-    ensure_dir(Path(path).parent)
+def train_config_from_args(args):
+    return {
+        "lr": args.lr,
+        "lr_backbone": args.lr_backbone,
+        "lr_drop": args.lr_drop,
+        "weight_decay": args.weight_decay,
+        "batch_size": args.batch_size,
+        "seed": args.seed,
+        "metric_backend": args.metric_backend,
+        "metric_score_threshold": args.metric_score_threshold,
+        "hflip_prob": args.hflip_prob,
+    }
+
+
+def save_checkpoint(
+    path: str | Path,
+    model,
+    optimizer,
+    scheduler,
+    epoch: int,
+    metrics: dict,
+    model_config: dict,
+    data_config: dict,
+    train_config: dict,
+    best_map50: float,
+):
+    path = Path(path)
+    ensure_dir(path.parent)
     checkpoint_model_config = dict(model_config)
     hf_model = getattr(model, "model", None)
-    if hf_model is not None and hasattr(hf_model, "config"):
-        checkpoint_model_config["hf_config"] = hf_model.config.to_dict()
+    if hf_model is not None and hasattr(hf_model, "save_pretrained"):
+        hf_dir = path.with_suffix("")
+        hf_dir = hf_dir.parent / f"{hf_dir.name}_hf"
+        hf_model.save_pretrained(hf_dir)
+        checkpoint_model_config["local_pretrained_dir"] = str(hf_dir)
     torch.save(
         {
             "epoch": epoch,
             "model": model.state_dict(),
-            "optimizer": optimizer.state_dict() if optimizer is not None else None,
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
             "metrics": metrics,
             "model_config": checkpoint_model_config,
-            "class_names": class_names,
+            "data_config": data_config,
+            "train_config": train_config,
+            "class_names": data_config["class_names"],
             "best_map50": best_map50,
         },
         path,
     )
 
 
-def load_checkpoint(path: str | Path, model, optimizer=None, device="cpu"):
+def apply_checkpoint_config(args, checkpoint: dict, for_train: bool = False):
+    model_config = checkpoint.get("model_config", {})
+    data_config = checkpoint.get("data_config", {})
+    train_config = checkpoint.get("train_config", {})
+
+    for key, value in model_config.items():
+        setattr(args, key, value)
+    if "max_size" in data_config:
+        args.max_size = data_config["max_size"]
+    if for_train:
+        for key in ("lr", "lr_backbone", "lr_drop", "weight_decay", "batch_size", "seed", "hflip_prob"):
+            if key in train_config:
+                setattr(args, key, train_config[key])
+    return data_config.get("class_names", checkpoint.get("class_names"))
+
+
+def load_checkpoint(path: str | Path, model, optimizer=None, scheduler=None, device="cpu"):
     checkpoint = torch.load(path, map_location=device)
     model.load_state_dict(checkpoint["model"])
     if optimizer is not None and checkpoint.get("optimizer") is not None:
         optimizer.load_state_dict(checkpoint["optimizer"])
+    if scheduler is not None and checkpoint.get("scheduler") is not None:
+        scheduler.load_state_dict(checkpoint["scheduler"])
     return checkpoint
 
 
-def train_one_epoch(model, criterion, loader, optimizer, device, epoch: int, writer, profile_dir: Path | None):
+def train_one_epoch(model, loader, optimizer, device, epoch: int, writer, profile_dir: Path | None, step_base: int):
     model.train()
     running, steps = {}, 0
     progress = tqdm(loader, desc=f"epoch {epoch}", leave=False)
-    loader_len = len(loader) if hasattr(loader, "__len__") else 1
 
     def run_step(samples, targets):
         optimizer.zero_grad(set_to_none=True)
-        outputs = model(samples, targets) if criterion is None else model(samples)
-        losses = loss_from_outputs(outputs, targets, criterion)
-        losses["loss_total"].backward()
+        outputs = model(samples, targets)
+        losses = loss_from_outputs(outputs)
+        loss = losses["loss_total"]
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"Non-finite loss: {loss.item()}")
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
         optimizer.step()
         return losses
@@ -179,65 +230,72 @@ def train_one_epoch(model, criterion, loader, optimizer, device, epoch: int, wri
         for key, value in losses.items():
             running[key] = running.get(key, 0.0) + float(value.detach().cpu())
         steps += 1
-        global_step = epoch * loader_len + step
+        global_step = step_base + step
         for key, value in losses.items():
             writer.add_scalar(f"train/{key}", float(value.detach().cpu()), global_step)
         progress.set_postfix({key: f"{value / steps:.4f}" for key, value in running.items()})
-    return {key: value / max(steps, 1) for key, value in running.items()}
+    return {key: value / max(steps, 1) for key, value in running.items()}, steps
 
 
 def cmd_train(args):
     set_seed(args.seed)
     device = torch.device(args.device)
     class_names = parse_class_names(args.class_names)
-    resume_checkpoint = None
-    if args.resume:
-        resume_checkpoint = torch.load(args.resume, map_location="cpu")
-        class_names = resume_checkpoint.get("class_names", class_names)
-        if "model_config" in resume_checkpoint:
-            apply_model_config(args, resume_checkpoint["model_config"])
-
-    train_loader, val_loader = build_loaders(args, class_names)
-    model, criterion = build_model_and_loss(args, class_names, device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
     start_epoch = 0
     best_map50 = -1.0
+    checkpoint = None
+
     if args.resume:
-        checkpoint = load_checkpoint(args.resume, model, optimizer, device)
+        checkpoint = torch.load(args.resume, map_location="cpu")
+        restored_classes = apply_checkpoint_config(args, checkpoint, for_train=True)
+        if restored_classes:
+            class_names = restored_classes
         start_epoch = int(checkpoint.get("epoch", -1)) + 1
         best_map50 = float(checkpoint.get("best_map50", checkpoint.get("metrics", {}).get("mAP50", -1.0)))
 
+    train_loader, val_loader = build_loaders(args, class_names)
+    model = build_model(args, class_names, device)
+    optimizer = build_optimizer(model, args)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_drop, gamma=0.1)
+
+    if args.resume:
+        load_checkpoint(args.resume, model, optimizer, scheduler, device)
+
     out = Path(args.output_dir)
-    run_name = "detr_resnet50_coco10" if args.model_type == "hf-detr" else "minidetr_coco10"
-    writer = make_summary_writer(out / "runs" / run_name)
+    writer = make_summary_writer(out / "runs" / "detr_resnet50_coco10")
     checkpoint_dir = ensure_dir(out / "checkpoints")
     profile_dir = ensure_dir(out / "profiler_traces") if args.profile else None
     metrics_csv = out / "reports" / "metrics.csv"
     if metrics_csv.exists() and start_epoch == 0 and not args.append_metrics:
         metrics_csv.unlink()
+
     model_config = model_config_from_args(args, class_names)
+    data_config = data_config_from_args(args, class_names)
+    train_config = train_config_from_args(args)
+    step_base = 0
 
     for epoch in range(start_epoch, args.epochs):
         train_iter = islice(train_loader, args.limit_train_batches) if args.limit_train_batches else train_loader
-        train_metrics = train_one_epoch(model, criterion, train_iter, optimizer, device, epoch, writer, profile_dir)
+        train_metrics, epoch_steps = train_one_epoch(model, train_iter, optimizer, device, epoch, writer, profile_dir, step_base)
+        step_base += epoch_steps
         val_metrics, _, _ = evaluate_model(
             model,
             val_loader,
-            criterion,
             device,
             len(class_names),
-            args.score_threshold,
-            args.top_k,
+            metric_score_threshold=args.metric_score_threshold,
+            top_k=args.top_k,
             metric_backend=args.metric_backend,
             annotation_file=args.val_annotations,
             class_names=class_names,
         )
+        scheduler.step()
 
         for key, value in train_metrics.items():
             writer.add_scalar(f"epoch_train/{key}", value, epoch)
         for key, value in val_metrics.items():
-            writer.add_scalar(f"epoch_val/{key}", value, epoch)
+            if isinstance(value, (int, float)):
+                writer.add_scalar(f"epoch_val/{key}", value, epoch)
 
         row = {
             "epoch": epoch,
@@ -247,6 +305,8 @@ def cmd_train(args):
             "train_loss_giou": train_metrics.get("loss_giou", 0.0),
             "mAP": val_metrics.get("mAP", 0.0),
             "mAP50": val_metrics.get("mAP50", 0.0),
+            "metric_backend": val_metrics.get("metric_backend", args.metric_backend),
+            "metric_score_threshold": val_metrics.get("metric_score_threshold", args.metric_score_threshold),
             "val_loss_total": val_metrics.get("val_loss_total", 0.0),
             "val_loss_ce": val_metrics.get("val_loss_ce", 0.0),
             "val_loss_bbox": val_metrics.get("val_loss_bbox", 0.0),
@@ -254,10 +314,10 @@ def cmd_train(args):
         }
         append_metrics_row(metrics_csv, row)
         current_best = max(best_map50, row["mAP50"])
-        save_checkpoint(checkpoint_dir / "last.pt", model, optimizer, epoch, val_metrics, model_config, class_names, current_best)
+        save_checkpoint(checkpoint_dir / "last.pt", model, optimizer, scheduler, epoch, val_metrics, model_config, data_config, train_config, current_best)
         if row["mAP50"] > best_map50:
             best_map50 = row["mAP50"]
-            save_checkpoint(checkpoint_dir / "best.pt", model, optimizer, epoch, val_metrics, model_config, class_names, best_map50)
+            save_checkpoint(checkpoint_dir / "best.pt", model, optimizer, scheduler, epoch, val_metrics, model_config, data_config, train_config, best_map50)
         print(row)
     writer.close()
 
@@ -266,20 +326,17 @@ def cmd_train(args):
 def cmd_eval(args):
     device = torch.device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
-    class_names = checkpoint.get("class_names", parse_class_names(args.class_names))
-    if "model_config" in checkpoint:
-        apply_model_config(args, checkpoint["model_config"])
+    class_names = apply_checkpoint_config(args, checkpoint) or parse_class_names(args.class_names)
     _, val_loader = build_loaders(args, class_names)
-    model, criterion = build_model_and_loss(args, class_names, device)
+    model = build_model(args, class_names, device)
     load_checkpoint(args.checkpoint, model, device=device)
     metrics, predictions, ground_truths = evaluate_model(
         model,
         val_loader,
-        criterion,
         device,
         len(class_names),
-        args.score_threshold,
-        args.top_k,
+        metric_score_threshold=args.metric_score_threshold,
+        top_k=args.top_k,
         metric_backend=args.metric_backend,
         annotation_file=args.val_annotations,
         class_names=class_names,
@@ -293,26 +350,35 @@ def cmd_eval(args):
 def cmd_errors(args):
     device = torch.device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
-    class_names = checkpoint.get("class_names", parse_class_names(args.class_names))
-    if "model_config" in checkpoint:
-        apply_model_config(args, checkpoint["model_config"])
+    class_names = apply_checkpoint_config(args, checkpoint) or parse_class_names(args.class_names)
     _, val_loader = build_loaders(args, class_names)
-    model, criterion = build_model_and_loss(args, class_names, device)
+    model = build_model(args, class_names, device)
     load_checkpoint(args.checkpoint, model, device=device)
     metrics, predictions, ground_truths = evaluate_model(
         model,
         val_loader,
-        criterion,
         device,
         len(class_names),
-        args.score_threshold,
-        args.top_k,
+        metric_score_threshold=args.metric_score_threshold,
+        top_k=args.top_k,
         metric_backend=args.metric_backend,
         annotation_file=args.val_annotations,
         class_names=class_names,
     )
-    errors = analyze_errors(predictions, ground_truths)
-    save_json(args.output, {"metrics": metrics, "errors": errors})
+    error_predictions = [pred for pred in predictions if pred["score"] >= args.error_score_threshold]
+    errors = analyze_errors(error_predictions, ground_truths)
+    save_json(
+        args.output,
+        {
+            "metrics": metrics,
+            "thresholds": {
+                "metric_score_threshold": args.metric_score_threshold,
+                "error_score_threshold": args.error_score_threshold,
+                "visual_score_threshold": args.visual_score_threshold,
+            },
+            "errors": errors,
+        },
+    )
 
     visual_dir = ensure_dir(args.visual_dir)
     saved = 0
@@ -346,27 +412,15 @@ def add_common_data_args(parser):
     parser.add_argument("--max-size", type=int, default=640)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=0)
-
-
-def add_model_args(parser):
-    parser.add_argument("--model-type", choices=["hf-detr", "mini"], default="hf-detr")
-    parser.add_argument("--pretrained-model", default="facebook/detr-resnet-50")
-    parser.add_argument("--num-queries", type=int, default=100)
-    parser.add_argument("--d-model", type=int, default=128)
-    parser.add_argument("--nhead", type=int, default=8)
-    parser.add_argument("--enc-layers", type=int, default=3)
-    parser.add_argument("--dec-layers", type=int, default=3)
-    parser.add_argument("--dim-ff", type=int, default=512)
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--cost-class", type=float, default=1.0)
-    parser.add_argument("--cost-bbox", type=float, default=5.0)
-    parser.add_argument("--cost-giou", type=float, default=2.0)
-    parser.add_argument("--eos-coef", type=float, default=0.1)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
 
+def add_model_args(parser):
+    parser.add_argument("--pretrained-model", default="facebook/detr-resnet-50")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Minimal DETR homework runner.")
+    parser = argparse.ArgumentParser(description="DETR fine-tuning homework runner.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     train_p = sub.add_parser("train")
@@ -376,15 +430,18 @@ def main():
     add_model_args(train_p)
     train_p.add_argument("--epochs", type=int, default=20)
     train_p.add_argument("--lr", type=float, default=1e-4)
+    train_p.add_argument("--lr-backbone", type=float, default=1e-5)
+    train_p.add_argument("--lr-drop", type=int, default=10)
     train_p.add_argument("--weight-decay", type=float, default=1e-4)
     train_p.add_argument("--seed", type=int, default=42)
+    train_p.add_argument("--hflip-prob", type=float, default=0.5)
     train_p.add_argument("--output-dir", default=".")
     train_p.add_argument("--resume", default=None)
     train_p.add_argument("--profile", action="store_true")
     train_p.add_argument("--limit-train-batches", type=int, default=None)
     train_p.add_argument("--append-metrics", action="store_true")
     train_p.add_argument("--metric-backend", choices=["simple", "coco"], default="coco")
-    train_p.add_argument("--score-threshold", type=float, default=0.05)
+    train_p.add_argument("--metric-score-threshold", type=float, default=0.0)
     train_p.add_argument("--top-k", type=int, default=100)
     train_p.set_defaults(func=cmd_train)
 
@@ -394,7 +451,7 @@ def main():
     eval_p.add_argument("--checkpoint", required=True)
     eval_p.add_argument("--output", default="reports/eval_metrics.json")
     eval_p.add_argument("--predictions", default="outputs/predictions.json")
-    eval_p.add_argument("--score-threshold", type=float, default=0.05)
+    eval_p.add_argument("--metric-score-threshold", type=float, default=0.0)
     eval_p.add_argument("--metric-backend", choices=["simple", "coco"], default="coco")
     eval_p.add_argument("--top-k", type=int, default=100)
     eval_p.set_defaults(func=cmd_eval)
@@ -411,9 +468,10 @@ def main():
     errors_p.add_argument("--output", default="outputs/error_analysis/errors.json")
     errors_p.add_argument("--visual-dir", default="outputs/visualizations")
     errors_p.add_argument("--max-visuals", type=int, default=16)
-    errors_p.add_argument("--score-threshold", type=float, default=0.05)
+    errors_p.add_argument("--metric-score-threshold", type=float, default=0.0)
     errors_p.add_argument("--metric-backend", choices=["simple", "coco"], default="coco")
-    errors_p.add_argument("--visual-score-threshold", type=float, default=0.3)
+    errors_p.add_argument("--error-score-threshold", type=float, default=0.3)
+    errors_p.add_argument("--visual-score-threshold", type=float, default=0.5)
     errors_p.add_argument("--top-k", type=int, default=100)
     errors_p.set_defaults(func=cmd_errors)
 
