@@ -1,8 +1,8 @@
-# MiniDETR COCO-subset
+# DETR Fine-tuning on COCO-subset
 
-Минимальный проект для HW3: DETR-подобный object detector на COCO-subset из 10
-классов. Структура специально упрощена: вся основная логика лежит в одном файле,
-а запуск — через один CLI.
+Минимальный проект для HW3: fine-tuning настоящего предобученного DETR
+`facebook/detr-resnet-50` на COCO-subset из 10 классов. Структура специально
+упрощена: вся основная логика лежит в одном файле, а запуск — через один CLI.
 
 ## Структура
 
@@ -11,7 +11,7 @@
 ├── prepare_coco_subset.py   # фильтрация COCO до 10 классов
 ├── requirements.txt
 ├── src/
-│   ├── minidetr.py          # dataset, model, matching, loss, metrics, plots, errors
+│   ├── minidetr.py          # dataset, HF DETR, MiniDETR, metrics, plots, errors
 │   └── train.py             # команды train/eval/plot/errors
 └── tests/
     └── test_core.py
@@ -22,17 +22,18 @@
 
 ## Что внутри
 
-- CNN backbone со stride 16.
-- 2D sine positional encoding.
-- Transformer encoder/decoder.
-- 100 object queries.
-- Hungarian matching.
-- DETR loss: classification + `5 * L1 bbox` + `2 * GIoU`.
-- `no-object` класс с весом `0.1`.
+- Основной режим: `DetrForObjectDetection.from_pretrained("facebook/detr-resnet-50")`.
+- Classification head заменяется на 10 классов через `num_labels=10` и
+  `ignore_mismatched_sizes=True`.
+- Hugging Face DETR внутри использует Hungarian matching и DETR loss:
+  classification + L1 bbox + GIoU.
+- Дополнительный учебный режим `--model-type mini` оставлен для самодельного
+  MiniDETR из лекционных фрагментов, но основной результат для сдачи нужно
+  получать через `--model-type hf-detr`.
 - TensorBoard logs.
 - Checkpoints `last.pt` и `best.pt`.
 - Profiler trace.
-- `mAP` и `mAP50`.
+- `mAP` и `mAP50`; по умолчанию используется `pycocotools.COCOeval`.
 - Error analysis: classification errors, localization errors, false positives,
   false negatives.
 
@@ -54,6 +55,7 @@ python -m src.train train ^
   --val-annotations data/coco_10cls/annotations/instances_val2017_10cls.json ^
   --epochs 20 ^
   --batch-size 2 ^
+  --model-type hf-detr ^
   --profile
 ```
 
@@ -77,6 +79,8 @@ python -m src.train train ^
 ```python
 !pip install -q -r requirements.txt
 ```
+
+Для скачивания `facebook/detr-resnet-50` в Kaggle должен быть включен Internet.
 
 ### 3. Задать путь к COCO
 
@@ -110,6 +114,8 @@ COCO_ROOT = "/kaggle/input/coco-2017-dataset/coco2017"
   --epochs 20 \
   --batch-size 2 \
   --num-workers 2 \
+  --model-type hf-detr \
+  --pretrained-model facebook/detr-resnet-50 \
   --output-dir /kaggle/working \
   --profile
 ```
@@ -125,6 +131,7 @@ COCO_ROOT = "/kaggle/input/coco-2017-dataset/coco2017"
   --epochs 1 \
   --batch-size 2 \
   --num-workers 2 \
+  --model-type hf-detr \
   --limit-train-batches 10 \
   --output-dir /kaggle/working \
   --profile
@@ -147,7 +154,8 @@ COCO_ROOT = "/kaggle/input/coco-2017-dataset/coco2017"
   --output /kaggle/working/reports/eval_metrics.json \
   --predictions /kaggle/working/outputs/predictions.json \
   --batch-size 2 \
-  --num-workers 2
+  --num-workers 2 \
+  --metric-backend coco
 ```
 
 ### 8. Построить график loss
@@ -169,6 +177,7 @@ COCO_ROOT = "/kaggle/input/coco-2017-dataset/coco2017"
   --visual-dir /kaggle/working/outputs/visualizations \
   --batch-size 2 \
   --num-workers 2 \
+  --metric-backend coco \
   --max-visuals 16
 ```
 
@@ -191,3 +200,21 @@ COCO_ROOT = "/kaggle/input/coco-2017-dataset/coco2017"
 - График потерь: `outputs/plots/losses.png`.
 - Визуализации и разбор ошибок: `outputs/visualizations/`,
   `outputs/error_analysis/errors.json`.
+
+## Если нужно запустить именно учебный MiniDETR
+
+Это не основной вариант для сдачи, потому что он обучается с нуля и не является
+fine-tuning предобученного DETR. Но он оставлен как компактная реализация идей из
+лекций:
+
+```python
+!python -m src.train train \
+  --train-images /kaggle/working/data/coco_10cls/train2017 \
+  --train-annotations /kaggle/working/data/coco_10cls/annotations/instances_train2017_10cls.json \
+  --val-images /kaggle/working/data/coco_10cls/val2017 \
+  --val-annotations /kaggle/working/data/coco_10cls/annotations/instances_val2017_10cls.json \
+  --model-type mini \
+  --epochs 1 \
+  --limit-train-batches 10 \
+  --output-dir /kaggle/working
+```

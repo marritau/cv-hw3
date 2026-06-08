@@ -8,6 +8,7 @@ from tqdm import tqdm
 
 from src.minidetr import (
     CocoDetectionSubset,
+    HFDetr,
     HungarianMatcher,
     MiniDETR,
     SetCriterion,
@@ -18,6 +19,7 @@ from src.minidetr import (
     draw_detections,
     ensure_dir,
     evaluate_model,
+    loss_from_outputs,
     make_summary_writer,
     move_targets_to_device,
     parse_class_names,
@@ -61,32 +63,72 @@ def build_loaders(args, class_names: list[str]):
 
 
 def build_model_and_loss(args, class_names: list[str], device: torch.device):
-    model = MiniDETR(
-        num_classes=len(class_names),
-        num_queries=args.num_queries,
-        d_model=args.d_model,
-        nhead=args.nhead,
-        enc_layers=args.enc_layers,
-        dec_layers=args.dec_layers,
-        dim_ff=args.dim_ff,
-        dropout=args.dropout,
-    ).to(device)
-    criterion = SetCriterion(
-        num_classes=len(class_names),
-        matcher=HungarianMatcher(args.cost_class, args.cost_bbox, args.cost_giou),
-        eos_coef=args.eos_coef,
-    ).to(device)
+    if args.model_type == "hf-detr":
+        model = HFDetr(
+            num_classes=len(class_names),
+            class_names=class_names,
+            pretrained_model=args.pretrained_model,
+            hf_config=getattr(args, "hf_config", None),
+        ).to(device)
+        criterion = None
+    else:
+        model = MiniDETR(
+            num_classes=len(class_names),
+            num_queries=args.num_queries,
+            d_model=args.d_model,
+            nhead=args.nhead,
+            enc_layers=args.enc_layers,
+            dec_layers=args.dec_layers,
+            dim_ff=args.dim_ff,
+            dropout=args.dropout,
+        ).to(device)
+        criterion = SetCriterion(
+            num_classes=len(class_names),
+            matcher=HungarianMatcher(args.cost_class, args.cost_bbox, args.cost_giou),
+            eos_coef=args.eos_coef,
+        ).to(device)
     return model, criterion
 
 
-def save_checkpoint(path: str | Path, model, optimizer, epoch: int, metrics: dict):
+def model_config_from_args(args, class_names: list[str]):
+    return {
+        "model_type": args.model_type,
+        "pretrained_model": args.pretrained_model,
+        "num_classes": len(class_names),
+        "num_queries": args.num_queries,
+        "d_model": args.d_model,
+        "nhead": args.nhead,
+        "enc_layers": args.enc_layers,
+        "dec_layers": args.dec_layers,
+        "dim_ff": args.dim_ff,
+        "dropout": args.dropout,
+        "cost_class": args.cost_class,
+        "cost_bbox": args.cost_bbox,
+        "cost_giou": args.cost_giou,
+        "eos_coef": args.eos_coef,
+    }
+
+
+def apply_model_config(args, config: dict):
+    for key, value in config.items():
+        setattr(args, key, value)
+
+
+def save_checkpoint(path: str | Path, model, optimizer, epoch: int, metrics: dict, model_config: dict, class_names: list[str], best_map50: float):
     ensure_dir(Path(path).parent)
+    checkpoint_model_config = dict(model_config)
+    hf_model = getattr(model, "model", None)
+    if hf_model is not None and hasattr(hf_model, "config"):
+        checkpoint_model_config["hf_config"] = hf_model.config.to_dict()
     torch.save(
         {
             "epoch": epoch,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict() if optimizer is not None else None,
             "metrics": metrics,
+            "model_config": checkpoint_model_config,
+            "class_names": class_names,
+            "best_map50": best_map50,
         },
         path,
     )
@@ -108,8 +150,8 @@ def train_one_epoch(model, criterion, loader, optimizer, device, epoch: int, wri
 
     def run_step(samples, targets):
         optimizer.zero_grad(set_to_none=True)
-        outputs = model(samples)
-        losses = criterion(outputs, targets)
+        outputs = model(samples, targets) if criterion is None else model(samples)
+        losses = loss_from_outputs(outputs, targets, criterion)
         losses["loss_total"].backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
         optimizer.step()
@@ -148,26 +190,49 @@ def cmd_train(args):
     set_seed(args.seed)
     device = torch.device(args.device)
     class_names = parse_class_names(args.class_names)
+    resume_checkpoint = None
+    if args.resume:
+        resume_checkpoint = torch.load(args.resume, map_location="cpu")
+        class_names = resume_checkpoint.get("class_names", class_names)
+        if "model_config" in resume_checkpoint:
+            apply_model_config(args, resume_checkpoint["model_config"])
+
     train_loader, val_loader = build_loaders(args, class_names)
     model, criterion = build_model_and_loss(args, class_names, device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     start_epoch = 0
+    best_map50 = -1.0
     if args.resume:
         checkpoint = load_checkpoint(args.resume, model, optimizer, device)
         start_epoch = int(checkpoint.get("epoch", -1)) + 1
+        best_map50 = float(checkpoint.get("best_map50", checkpoint.get("metrics", {}).get("mAP50", -1.0)))
 
     out = Path(args.output_dir)
-    writer = make_summary_writer(out / "runs" / "minidetr_coco10")
+    run_name = "detr_resnet50_coco10" if args.model_type == "hf-detr" else "minidetr_coco10"
+    writer = make_summary_writer(out / "runs" / run_name)
     checkpoint_dir = ensure_dir(out / "checkpoints")
     profile_dir = ensure_dir(out / "profiler_traces") if args.profile else None
     metrics_csv = out / "reports" / "metrics.csv"
-    best_map50 = -1.0
+    if metrics_csv.exists() and start_epoch == 0 and not args.append_metrics:
+        metrics_csv.unlink()
+    model_config = model_config_from_args(args, class_names)
 
     for epoch in range(start_epoch, args.epochs):
         train_iter = islice(train_loader, args.limit_train_batches) if args.limit_train_batches else train_loader
         train_metrics = train_one_epoch(model, criterion, train_iter, optimizer, device, epoch, writer, profile_dir)
-        val_metrics, _, _ = evaluate_model(model, val_loader, criterion, device, len(class_names), args.score_threshold, args.top_k)
+        val_metrics, _, _ = evaluate_model(
+            model,
+            val_loader,
+            criterion,
+            device,
+            len(class_names),
+            args.score_threshold,
+            args.top_k,
+            metric_backend=args.metric_backend,
+            annotation_file=args.val_annotations,
+            class_names=class_names,
+        )
 
         for key, value in train_metrics.items():
             writer.add_scalar(f"epoch_train/{key}", value, epoch)
@@ -188,10 +253,11 @@ def cmd_train(args):
             "val_loss_giou": val_metrics.get("val_loss_giou", 0.0),
         }
         append_metrics_row(metrics_csv, row)
-        save_checkpoint(checkpoint_dir / "last.pt", model, optimizer, epoch, val_metrics)
+        current_best = max(best_map50, row["mAP50"])
+        save_checkpoint(checkpoint_dir / "last.pt", model, optimizer, epoch, val_metrics, model_config, class_names, current_best)
         if row["mAP50"] > best_map50:
             best_map50 = row["mAP50"]
-            save_checkpoint(checkpoint_dir / "best.pt", model, optimizer, epoch, val_metrics)
+            save_checkpoint(checkpoint_dir / "best.pt", model, optimizer, epoch, val_metrics, model_config, class_names, best_map50)
         print(row)
     writer.close()
 
@@ -199,11 +265,25 @@ def cmd_train(args):
 @torch.no_grad()
 def cmd_eval(args):
     device = torch.device(args.device)
-    class_names = parse_class_names(args.class_names)
+    checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    class_names = checkpoint.get("class_names", parse_class_names(args.class_names))
+    if "model_config" in checkpoint:
+        apply_model_config(args, checkpoint["model_config"])
     _, val_loader = build_loaders(args, class_names)
     model, criterion = build_model_and_loss(args, class_names, device)
     load_checkpoint(args.checkpoint, model, device=device)
-    metrics, predictions, ground_truths = evaluate_model(model, val_loader, criterion, device, len(class_names), args.score_threshold, args.top_k)
+    metrics, predictions, ground_truths = evaluate_model(
+        model,
+        val_loader,
+        criterion,
+        device,
+        len(class_names),
+        args.score_threshold,
+        args.top_k,
+        metric_backend=args.metric_backend,
+        annotation_file=args.val_annotations,
+        class_names=class_names,
+    )
     save_json(args.output, metrics)
     save_json(args.predictions, {"predictions": predictions, "ground_truths": ground_truths})
     print(metrics)
@@ -212,11 +292,25 @@ def cmd_eval(args):
 @torch.no_grad()
 def cmd_errors(args):
     device = torch.device(args.device)
-    class_names = parse_class_names(args.class_names)
+    checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    class_names = checkpoint.get("class_names", parse_class_names(args.class_names))
+    if "model_config" in checkpoint:
+        apply_model_config(args, checkpoint["model_config"])
     _, val_loader = build_loaders(args, class_names)
     model, criterion = build_model_and_loss(args, class_names, device)
     load_checkpoint(args.checkpoint, model, device=device)
-    metrics, predictions, ground_truths = evaluate_model(model, val_loader, criterion, device, len(class_names), args.score_threshold, args.top_k)
+    metrics, predictions, ground_truths = evaluate_model(
+        model,
+        val_loader,
+        criterion,
+        device,
+        len(class_names),
+        args.score_threshold,
+        args.top_k,
+        metric_backend=args.metric_backend,
+        annotation_file=args.val_annotations,
+        class_names=class_names,
+    )
     errors = analyze_errors(predictions, ground_truths)
     save_json(args.output, {"metrics": metrics, "errors": errors})
 
@@ -255,6 +349,8 @@ def add_common_data_args(parser):
 
 
 def add_model_args(parser):
+    parser.add_argument("--model-type", choices=["hf-detr", "mini"], default="hf-detr")
+    parser.add_argument("--pretrained-model", default="facebook/detr-resnet-50")
     parser.add_argument("--num-queries", type=int, default=100)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--nhead", type=int, default=8)
@@ -286,6 +382,8 @@ def main():
     train_p.add_argument("--resume", default=None)
     train_p.add_argument("--profile", action="store_true")
     train_p.add_argument("--limit-train-batches", type=int, default=None)
+    train_p.add_argument("--append-metrics", action="store_true")
+    train_p.add_argument("--metric-backend", choices=["simple", "coco"], default="coco")
     train_p.add_argument("--score-threshold", type=float, default=0.05)
     train_p.add_argument("--top-k", type=int, default=100)
     train_p.set_defaults(func=cmd_train)
@@ -297,6 +395,7 @@ def main():
     eval_p.add_argument("--output", default="reports/eval_metrics.json")
     eval_p.add_argument("--predictions", default="outputs/predictions.json")
     eval_p.add_argument("--score-threshold", type=float, default=0.05)
+    eval_p.add_argument("--metric-backend", choices=["simple", "coco"], default="coco")
     eval_p.add_argument("--top-k", type=int, default=100)
     eval_p.set_defaults(func=cmd_eval)
 
@@ -313,6 +412,7 @@ def main():
     errors_p.add_argument("--visual-dir", default="outputs/visualizations")
     errors_p.add_argument("--max-visuals", type=int, default=16)
     errors_p.add_argument("--score-threshold", type=float, default=0.05)
+    errors_p.add_argument("--metric-backend", choices=["simple", "coco"], default="coco")
     errors_p.add_argument("--visual-score-threshold", type=float, default=0.3)
     errors_p.add_argument("--top-k", type=int, default=100)
     errors_p.set_defaults(func=cmd_errors)

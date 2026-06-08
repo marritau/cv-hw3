@@ -69,6 +69,18 @@ def filter_split(coco_root: Path, out_root: Path, split: str, class_names: list[
     image_ids = {int(img["id"]) for img in images}
     annotations = [ann for img_id in image_ids for ann in anns_by_image[img_id]]
     categories = [name_to_cat[name] for name in class_names]
+    cat_id_to_name = {int(cat["id"]): cat["name"] for cat in categories}
+    class_counts = {name: 0 for name in class_names}
+    for ann in annotations:
+        name = cat_id_to_name[int(ann["category_id"])]
+        class_counts[name] += 1
+
+    missing_after_sampling = [name for name, count in class_counts.items() if count == 0]
+    if missing_after_sampling:
+        raise RuntimeError(
+            f"{split}: after sampling these classes have zero objects: {missing_after_sampling}. "
+            "Increase --max-train-images/--max-val-images or choose another class list."
+        )
 
     for img in images:
         copy_or_link(image_src_dir / img["file_name"], image_out_dir / img["file_name"], link_mode)
@@ -87,6 +99,8 @@ def filter_split(coco_root: Path, out_root: Path, split: str, class_names: list[
             ensure_ascii=False,
         )
     print(f"{split}: {len(images)} images, {len(annotations)} boxes -> {out_ann_path}")
+    for name, count in class_counts.items():
+        print(f"  {name}: {count}")
 
 
 def main():

@@ -388,6 +388,50 @@ class MiniDETR(nn.Module):
         return {"logits": self.class_embed(tgt), "boxes": self.bbox_embed(tgt).sigmoid(), "mask": mask, "memory": memory}
 
 
+class HFDetr(nn.Module):
+    """Thin wrapper around pretrained facebook/detr-resnet-50 for real fine-tuning."""
+
+    def __init__(
+        self,
+        num_classes: int,
+        class_names: list[str],
+        pretrained_model: str = "facebook/detr-resnet-50",
+        hf_config: dict | None = None,
+    ):
+        super().__init__()
+        from transformers import DetrConfig, DetrForObjectDetection
+
+        id2label = {idx: name for idx, name in enumerate(class_names)}
+        label2id = {name: idx for idx, name in id2label.items()}
+        if hf_config is None:
+            self.model = DetrForObjectDetection.from_pretrained(
+                pretrained_model,
+                num_labels=num_classes,
+                id2label=id2label,
+                label2id=label2id,
+                ignore_mismatched_sizes=True,
+            )
+        else:
+            config = DetrConfig.from_dict(hf_config)
+            config.num_labels = num_classes
+            config.id2label = id2label
+            config.label2id = label2id
+            config.use_pretrained_backbone = False
+            self.model = DetrForObjectDetection(config)
+
+    def forward(self, samples: dict[str, torch.Tensor], targets: list[dict[str, torch.Tensor]] | None = None):
+        labels = None
+        if targets is not None:
+            labels = [{"class_labels": target["labels"], "boxes": target["boxes"]} for target in targets]
+        pixel_mask = (~samples["masks"].bool()).long()
+        outputs = self.model(pixel_values=samples["images"], pixel_mask=pixel_mask, labels=labels)
+        result = {"logits": outputs.logits, "boxes": outputs.pred_boxes}
+        if outputs.loss is not None:
+            result["loss"] = outputs.loss
+            result["loss_dict"] = outputs.loss_dict or {}
+        return result
+
+
 @dataclass
 class HungarianMatcher:
     cost_class: float = 1.0
@@ -460,6 +504,21 @@ class SetCriterion(nn.Module):
         }
 
 
+def loss_from_outputs(outputs: dict[str, torch.Tensor], targets: list[dict[str, torch.Tensor]], criterion: nn.Module | None):
+    if criterion is not None:
+        return criterion(outputs, targets)
+
+    loss_dict = outputs.get("loss_dict", {})
+    zero = outputs["logits"].sum() * 0.0
+    loss_total = outputs.get("loss", zero)
+    return {
+        "loss_total": loss_total,
+        "loss_ce": loss_dict.get("loss_ce", zero).detach(),
+        "loss_bbox": loss_dict.get("loss_bbox", zero).detach(),
+        "loss_giou": loss_dict.get("loss_giou", zero).detach(),
+    }
+
+
 @torch.no_grad()
 def batch_to_predictions(outputs: dict[str, torch.Tensor], targets: list[dict], score_threshold: float = 0.05, top_k: int = 100):
     logits = outputs["logits"].detach().cpu()
@@ -516,12 +575,17 @@ def compute_detection_metrics(predictions: list[dict], ground_truths: list[dict]
                     continue
                 pred_box = torch.tensor(pred["box"], dtype=torch.float32).view(1, 4)
                 gt_boxes = torch.tensor([gt["box"] for gt in candidates], dtype=torch.float32)
-                best_iou, best_idx = torch.max(pairwise_iou(pred_box, gt_boxes)[0], dim=0)
-                best_gt = candidates[int(best_idx)]
-                if float(best_iou) >= threshold and not best_gt["matched"]:
-                    tp[idx] = 1.0
-                    best_gt["matched"] = True
-                else:
+                ious = pairwise_iou(pred_box, gt_boxes)[0]
+                order = torch.argsort(ious, descending=True)
+                matched = False
+                for gt_idx in order.tolist():
+                    best_gt = candidates[gt_idx]
+                    if float(ious[gt_idx]) >= threshold and not best_gt["matched"]:
+                        tp[idx] = 1.0
+                        best_gt["matched"] = True
+                        matched = True
+                        break
+                if not matched:
                     fp[idx] = 1.0
             cum_tp, cum_fp = np.cumsum(tp), np.cumsum(fp)
             ap_by_threshold[threshold].append(_ap_from_pr(cum_tp / max(len(gt_class), 1), cum_tp / np.maximum(cum_tp + cum_fp, 1e-7)))
@@ -529,22 +593,77 @@ def compute_detection_metrics(predictions: list[dict], ground_truths: list[dict]
     return {"mAP": float(np.mean(list(mean_by_threshold.values()))), "mAP50": mean_by_threshold.get(0.5, 0.0)}
 
 
+def compute_coco_metrics(predictions: list[dict], annotation_file: str | Path, class_names: list[str]):
+    try:
+        from pycocotools.coco import COCO
+        from pycocotools.cocoeval import COCOeval
+    except Exception:
+        return None
+
+    coco_gt = COCO(str(annotation_file))
+    name_to_cat_id = {cat["name"]: int(cat["id"]) for cat in coco_gt.loadCats(coco_gt.getCatIds())}
+    label_to_cat_id = {idx: name_to_cat_id[name] for idx, name in enumerate(class_names) if name in name_to_cat_id}
+    image_info = {int(img["id"]): img for img in coco_gt.dataset["images"]}
+
+    coco_predictions = []
+    for pred in predictions:
+        image_id = int(pred["image_id"])
+        if int(pred["label"]) not in label_to_cat_id or image_id not in image_info:
+            continue
+        width = image_info[image_id]["width"]
+        height = image_info[image_id]["height"]
+        x0, y0, x1, y1 = pred["box"]
+        coco_predictions.append(
+            {
+                "image_id": image_id,
+                "category_id": label_to_cat_id[int(pred["label"])],
+                "bbox": [x0 * width, y0 * height, max(0.0, (x1 - x0) * width), max(0.0, (y1 - y0) * height)],
+                "score": float(pred["score"]),
+            }
+        )
+
+    if not coco_predictions:
+        return {"mAP": 0.0, "mAP50": 0.0}
+    coco_dt = coco_gt.loadRes(coco_predictions)
+    coco_eval = COCOeval(coco_gt, coco_dt, "bbox")
+    coco_eval.params.catIds = list(label_to_cat_id.values())
+    coco_eval.evaluate()
+    coco_eval.accumulate()
+    coco_eval.summarize()
+    return {"mAP": float(coco_eval.stats[0]), "mAP50": float(coco_eval.stats[1])}
+
+
 @torch.no_grad()
-def evaluate_model(model, loader, criterion, device, num_classes: int, score_threshold: float = 0.05, top_k: int = 100):
+def evaluate_model(
+    model,
+    loader,
+    criterion,
+    device,
+    num_classes: int,
+    score_threshold: float = 0.05,
+    top_k: int = 100,
+    metric_backend: str = "simple",
+    annotation_file: str | Path | None = None,
+    class_names: list[str] | None = None,
+):
     model.eval()
     predictions, ground_truths, loss_totals, steps = [], [], {}, 0
     for samples, targets in loader:
         samples = {key: value.to(device) for key, value in samples.items()}
         targets = move_targets_to_device(targets, device)
-        outputs = model(samples)
-        losses = criterion(outputs, targets)
+        outputs = model(samples, targets) if criterion is None else model(samples)
+        losses = loss_from_outputs(outputs, targets, criterion)
         for key, value in losses.items():
             loss_totals[key] = loss_totals.get(key, 0.0) + float(value.detach().cpu())
         batch_preds, batch_gts = batch_to_predictions(outputs, targets, score_threshold, top_k)
         predictions.extend(batch_preds)
         ground_truths.extend(batch_gts)
         steps += 1
-    metrics = compute_detection_metrics(predictions, ground_truths, num_classes)
+    metrics = None
+    if metric_backend == "coco" and annotation_file is not None and class_names is not None:
+        metrics = compute_coco_metrics(predictions, annotation_file, class_names)
+    if metrics is None:
+        metrics = compute_detection_metrics(predictions, ground_truths, num_classes)
     metrics.update({f"val_{key}": value / max(steps, 1) for key, value in loss_totals.items()})
     return metrics, predictions, ground_truths
 
@@ -574,27 +693,49 @@ def analyze_errors(predictions: list[dict], ground_truths: list[dict], iou_match
         gt_by_image[int(gt["image_id"])].append(gt)
     for pred in predictions:
         pred_by_image[int(pred["image_id"])].append(pred)
-    summary = {"classification_errors": [], "localization_errors": [], "false_positives": [], "false_negatives": []}
+    summary = {
+        "classification_errors": [],
+        "localization_errors": [],
+        "duplicate_false_positives": [],
+        "background_false_positives": [],
+        "false_positives": [],
+        "false_negatives": [],
+    }
     matched_gt = set()
     for image_id, preds in pred_by_image.items():
         gts = gt_by_image.get(image_id, [])
         if not gts:
+            summary["background_false_positives"].extend(preds)
             summary["false_positives"].extend(preds)
             continue
         gt_boxes = torch.tensor([gt["box"] for gt in gts], dtype=torch.float32)
         for pred in sorted(preds, key=lambda item: float(item["score"]), reverse=True):
             ious = pairwise_iou(torch.tensor(pred["box"], dtype=torch.float32).view(1, 4), gt_boxes)[0]
-            best_iou, best_idx = torch.max(ious, dim=0)
-            gt = gts[int(best_idx)]
-            gt_key = (image_id, int(best_idx))
-            item = {**pred, "best_iou": float(best_iou), "gt_label": int(gt["label"])}
-            if float(best_iou) >= iou_match and int(pred["label"]) == int(gt["label"]) and gt_key not in matched_gt:
+            order = torch.argsort(ious, descending=True).tolist()
+            best_any_idx = order[0]
+            best_any_iou = float(ious[best_any_idx])
+            best_unmatched_idx = next((idx for idx in order if (image_id, idx) not in matched_gt), None)
+
+            if best_unmatched_idx is None:
+                item = {**pred, "best_iou": best_any_iou}
+                summary["duplicate_false_positives"].append(item)
+                summary["false_positives"].append(item)
+                continue
+
+            gt = gts[best_unmatched_idx]
+            gt_key = (image_id, best_unmatched_idx)
+            best_iou = float(ious[best_unmatched_idx])
+            item = {**pred, "best_iou": best_iou, "gt_label": int(gt["label"])}
+            if best_iou >= iou_match and int(pred["label"]) == int(gt["label"]):
                 matched_gt.add(gt_key)
-            elif float(best_iou) >= iou_match and int(pred["label"]) != int(gt["label"]):
+            elif best_iou >= iou_match and int(pred["label"]) != int(gt["label"]):
+                matched_gt.add(gt_key)
                 summary["classification_errors"].append(item)
-            elif int(pred["label"]) == int(gt["label"]) and float(best_iou) >= 0.1:
+            elif int(pred["label"]) == int(gt["label"]) and best_iou >= 0.1:
+                matched_gt.add(gt_key)
                 summary["localization_errors"].append(item)
             else:
+                summary["background_false_positives"].append(item)
                 summary["false_positives"].append(item)
     for image_id, gts in gt_by_image.items():
         for idx, gt in enumerate(gts):
