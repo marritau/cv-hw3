@@ -348,7 +348,12 @@ def compute_detection_metrics(predictions: list[dict], ground_truths: list[dict]
     return {"mAP": float(np.mean(list(mean_by_threshold.values()))), "mAP50": mean_by_threshold.get(0.5, 0.0), "metric_backend": "simple"}
 
 
-def compute_coco_metrics(predictions: list[dict], annotation_file: str | Path, class_names: list[str]):
+def compute_coco_metrics(
+    predictions: list[dict],
+    annotation_file: str | Path,
+    class_names: list[str],
+    image_ids: set[int] | None = None,
+):
     try:
         from pycocotools.coco import COCO
         from pycocotools.cocoeval import COCOeval
@@ -383,6 +388,8 @@ def compute_coco_metrics(predictions: list[dict], annotation_file: str | Path, c
         coco_dt = coco_gt.loadRes(coco_predictions)
         coco_eval = COCOeval(coco_gt, coco_dt, "bbox")
         coco_eval.params.catIds = list(label_to_cat_id.values())
+        if image_ids is not None:
+            coco_eval.params.imgIds = sorted(image_ids)
         coco_eval.evaluate()
         coco_eval.accumulate()
         coco_eval.summarize()
@@ -402,10 +409,13 @@ def evaluate_model(
     metric_backend: str = "coco",
     annotation_file: str | Path | None = None,
     class_names: list[str] | None = None,
+    limit_batches: int | None = None,
 ):
     model.eval()
     predictions, ground_truths, loss_totals, steps = [], [], {}, 0
-    for samples, targets in loader:
+    for batch_idx, (samples, targets) in enumerate(loader):
+        if limit_batches is not None and batch_idx >= limit_batches:
+            break
         samples = {key: value.to(device) for key, value in samples.items()}
         targets = move_targets_to_device(targets, device)
         outputs = model(samples, targets)
@@ -420,7 +430,8 @@ def evaluate_model(
     if metric_backend == "coco":
         if annotation_file is None or class_names is None:
             raise RuntimeError("COCOeval требует annotation_file и class_names.")
-        metrics = compute_coco_metrics(predictions, annotation_file, class_names)
+        image_ids = {int(gt["image_id"]) for gt in ground_truths}
+        metrics = compute_coco_metrics(predictions, annotation_file, class_names, image_ids=image_ids)
     elif metric_backend == "simple":
         metrics = compute_detection_metrics(predictions, ground_truths, num_classes)
     else:
@@ -546,4 +557,3 @@ def draw_detections(image: torch.Tensor, size: torch.Tensor, gt_items: list[dict
         draw_box(pred, "red", "pred")
     ensure_dir(Path(out_path).parent)
     pil.save(out_path)
-

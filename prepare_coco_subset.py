@@ -131,7 +131,7 @@ def filter_split(
 def main():
     parser = argparse.ArgumentParser(description="Prepare a 10-class COCO subset.")
     parser.add_argument("--coco-root", required=True, help="Path with train2017, val2017, annotations.")
-    parser.add_argument("--out-root", default="data/coco_10cls")
+    parser.add_argument("--out-root", "--output-root", default="data/coco_10cls")
     parser.add_argument("--classes", default=None, help="Comma-separated COCO class names.")
     parser.add_argument("--max-train-images", type=int, default=3000)
     parser.add_argument("--max-val-images", type=int, default=500)

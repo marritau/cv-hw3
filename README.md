@@ -95,6 +95,7 @@ COCO_ROOT = "/kaggle/working/coco"
   --batch-size 2 \
   --num-workers 2 \
   --limit-train-batches 10 \
+  --limit-val-batches 5 \
   --metric-score-threshold 0.0 \
   --output-dir /kaggle/working \
   --profile

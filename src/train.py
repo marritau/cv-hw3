@@ -288,6 +288,7 @@ def cmd_train(args):
             metric_backend=args.metric_backend,
             annotation_file=args.val_annotations,
             class_names=class_names,
+            limit_batches=args.limit_val_batches,
         )
         scheduler.step()
 
@@ -340,6 +341,7 @@ def cmd_eval(args):
         metric_backend=args.metric_backend,
         annotation_file=args.val_annotations,
         class_names=class_names,
+        limit_batches=args.limit_val_batches,
     )
     save_json(args.output, metrics)
     save_json(args.predictions, {"predictions": predictions, "ground_truths": ground_truths})
@@ -364,6 +366,7 @@ def cmd_errors(args):
         metric_backend=args.metric_backend,
         annotation_file=args.val_annotations,
         class_names=class_names,
+        limit_batches=args.limit_val_batches,
     )
     error_predictions = [pred for pred in predictions if pred["score"] >= args.error_score_threshold]
     errors = analyze_errors(error_predictions, ground_truths)
@@ -407,7 +410,7 @@ def cmd_errors(args):
 
 def add_common_data_args(parser):
     parser.add_argument("--val-images", required=True)
-    parser.add_argument("--val-annotations", required=True)
+    parser.add_argument("--val-annotations", "--val-ann", required=True, dest="val_annotations")
     parser.add_argument("--class-names", default="person,bicycle,car,motorcycle,bus,train,truck,traffic light,stop sign,dog")
     parser.add_argument("--max-size", type=int, default=640)
     parser.add_argument("--batch-size", type=int, default=2)
@@ -425,7 +428,7 @@ def main():
 
     train_p = sub.add_parser("train")
     train_p.add_argument("--train-images", required=True)
-    train_p.add_argument("--train-annotations", required=True)
+    train_p.add_argument("--train-annotations", "--train-ann", required=True, dest="train_annotations")
     add_common_data_args(train_p)
     add_model_args(train_p)
     train_p.add_argument("--epochs", type=int, default=20)
@@ -439,6 +442,7 @@ def main():
     train_p.add_argument("--resume", default=None)
     train_p.add_argument("--profile", action="store_true")
     train_p.add_argument("--limit-train-batches", type=int, default=None)
+    train_p.add_argument("--limit-val-batches", type=int, default=None)
     train_p.add_argument("--append-metrics", action="store_true")
     train_p.add_argument("--metric-backend", choices=["simple", "coco"], default="coco")
     train_p.add_argument("--metric-score-threshold", type=float, default=0.0)
@@ -451,6 +455,7 @@ def main():
     eval_p.add_argument("--checkpoint", required=True)
     eval_p.add_argument("--output", default="reports/eval_metrics.json")
     eval_p.add_argument("--predictions", default="outputs/predictions.json")
+    eval_p.add_argument("--limit-val-batches", type=int, default=None)
     eval_p.add_argument("--metric-score-threshold", type=float, default=0.0)
     eval_p.add_argument("--metric-backend", choices=["simple", "coco"], default="coco")
     eval_p.add_argument("--top-k", type=int, default=100)
@@ -468,6 +473,7 @@ def main():
     errors_p.add_argument("--output", default="outputs/error_analysis/errors.json")
     errors_p.add_argument("--visual-dir", default="outputs/visualizations")
     errors_p.add_argument("--max-visuals", type=int, default=16)
+    errors_p.add_argument("--limit-val-batches", type=int, default=None)
     errors_p.add_argument("--metric-score-threshold", type=float, default=0.0)
     errors_p.add_argument("--metric-backend", choices=["simple", "coco"], default="coco")
     errors_p.add_argument("--error-score-threshold", type=float, default=0.3)
