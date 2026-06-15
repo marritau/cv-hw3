@@ -84,16 +84,66 @@ def filter_split(
             if w > 0 and h > 0:
                 anns_by_image.setdefault(int(ann["image_id"]), []).append(ann)
 
-    images = [img for img in coco["images"] if int(img["id"]) in anns_by_image]
-    images.sort(key=lambda img: int(img["id"]))
-    if max_images is not None and len(images) > max_images:
-        images = random.Random(seed).sample(images, k=max_images)
-        images.sort(key=lambda img: int(img["id"]))
-
-    image_ids = {int(img["id"]) for img in images}
-    annotations = [ann for img_id in sorted(image_ids) for ann in anns_by_image[img_id]]
     categories = [name_to_cat[name] for name in class_names]
     cat_id_to_name = {int(cat["id"]): cat["name"] for cat in categories}
+
+    candidates = [img for img in coco["images"] if int(img["id"]) in anns_by_image]
+    candidates.sort(key=lambda img: int(img["id"]))
+    limit = len(candidates) if max_images is None else min(max_images, len(candidates))
+
+    rng = random.Random(seed)
+    shuffled_candidates = list(candidates)
+    rng.shuffle(shuffled_candidates)
+
+    per_image_counts = {}
+    for img in candidates:
+        counts = {name: 0 for name in class_names}
+        for ann in anns_by_image[int(img["id"])]:
+            counts[cat_id_to_name[int(ann["category_id"])]] += 1
+        per_image_counts[int(img["id"])] = counts
+
+    class_counts = {name: 0 for name in class_names}
+    selected_by_id = {}
+
+    def add_image(img):
+        image_id = int(img["id"])
+        if image_id in selected_by_id:
+            return
+        selected_by_id[image_id] = img
+        for name, count in per_image_counts[image_id].items():
+            class_counts[name] += count
+
+    while len(selected_by_id) < limit:
+        deficits = {name: max(0, min_instances_per_class - count) for name, count in class_counts.items()}
+        if not any(deficits.values()):
+            break
+
+        best_img = None
+        best_score = (0, 0)
+        for img in shuffled_candidates:
+            image_id = int(img["id"])
+            if image_id in selected_by_id:
+                continue
+            counts = per_image_counts[image_id]
+            deficit_score = sum(min(counts[name], deficits[name]) for name in class_names)
+            total_score = sum(counts.values())
+            score = (deficit_score, total_score)
+            if score > best_score:
+                best_score = score
+                best_img = img
+
+        if best_img is None or best_score[0] == 0:
+            break
+        add_image(best_img)
+
+    remaining = [img for img in shuffled_candidates if int(img["id"]) not in selected_by_id]
+    for img in remaining[: max(0, limit - len(selected_by_id))]:
+        add_image(img)
+
+    images = sorted(selected_by_id.values(), key=lambda img: int(img["id"]))
+    image_ids = {int(img["id"]) for img in images}
+    annotations = [ann for img_id in sorted(image_ids) for ann in anns_by_image[img_id]]
+
     class_counts = {name: 0 for name in class_names}
     for ann in annotations:
         name = cat_id_to_name[int(ann["category_id"])]

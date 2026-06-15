@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -6,6 +8,7 @@ from pathlib import Path
 import torch
 from PIL import Image
 
+from prepare_coco_subset import filter_split
 from src.detr import (
     CocoDetectionSubset,
     analyze_errors,
@@ -70,6 +73,35 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(tuple(samples["images"].shape), (2, 3, 100, 100))
             self.assertEqual(tuple(samples["masks"].shape), (2, 100, 100))
             self.assertEqual(len(targets), 2)
+
+    def test_subset_sampling_covers_minimum_class_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ann_dir = root / "coco" / "annotations"
+            ann_dir.mkdir(parents=True)
+            images = [{"id": idx, "file_name": f"{idx}.jpg", "width": 10, "height": 10} for idx in range(1, 5)]
+            categories = [{"id": idx, "name": name} for idx, name in enumerate(["a", "b", "c"], start=1)]
+            annotations = [
+                {"id": 1, "image_id": 1, "category_id": 1, "bbox": [0, 0, 5, 5], "iscrowd": 0},
+                {"id": 2, "image_id": 2, "category_id": 1, "bbox": [0, 0, 5, 5], "iscrowd": 0},
+                {"id": 3, "image_id": 3, "category_id": 2, "bbox": [0, 0, 5, 5], "iscrowd": 0},
+                {"id": 4, "image_id": 4, "category_id": 3, "bbox": [0, 0, 5, 5], "iscrowd": 0},
+            ]
+            (ann_dir / "instances_val2017.json").write_text(
+                json.dumps({"images": images, "annotations": annotations, "categories": categories}),
+                encoding="utf-8",
+            )
+
+            out = root / "subset"
+            with contextlib.redirect_stdout(io.StringIO()):
+                filter_split(root / "coco", out, "val2017", ["a", "b", "c"], max_images=3, min_instances_per_class=1, seed=0, link_mode="none")
+            subset = json.loads((out / "annotations" / "instances_val2017_3cls.json").read_text(encoding="utf-8"))
+            counts = {"a": 0, "b": 0, "c": 0}
+            id_to_name = {item["id"]: item["name"] for item in subset["categories"]}
+            for ann in subset["annotations"]:
+                counts[id_to_name[ann["category_id"]]] += 1
+            self.assertEqual(len(subset["images"]), 3)
+            self.assertEqual(counts, {"a": 1, "b": 1, "c": 1})
 
     def test_loss_from_hf_style_outputs(self):
         logits = torch.randn(2, 100, 11)
@@ -149,4 +181,3 @@ class CoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
