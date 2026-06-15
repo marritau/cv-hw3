@@ -1,97 +1,53 @@
-# DETR Fine-tuning on COCO-subset
+# HW3: DETR fine-tuning + synthetic data ablation
 
-fine-tuning настоящего предобученного DETR
-`facebook/detr-resnet-50` на COCO-subset из 10 классов.
+Репозиторий закрывает обе части задания из `HW3 (2).md`:
+
+- HW2: fine-tuning `facebook/detr-resnet-50` на COCO-subset минимум из 10 классов.
+- HW2.5: генерация синтетики через Stable Diffusion + ControlNet и ablation
+  `real only` vs `real + synthetic` для CNN-классификатора.
 
 ## Структура
 
 ```text
 .
-├── prepare_coco_subset.py   # фильтрация COCO до 10 классов
+├── prepare_coco_subset.py        # COCO-subset для DETR и 2.5
 ├── requirements.txt
 ├── src/
-│   ├── detr.py              # dataset, HF DETR, metrics, plots, errors
-│   └── train.py             # команды train/eval/plot/errors
+│   ├── detr.py                   # dataset, DETR, COCOeval, plots, errors
+│   ├── train.py                  # train/eval/plot/errors для DETR
+│   └── synthetic_ablation.py     # rare classes, crops, ControlNet, ablation
 └── tests/
     └── test_core.py
 ```
 
-## Что внутри
-
-- Основной режим: `DetrForObjectDetection.from_pretrained("facebook/detr-resnet-50")`.
-- Classification head заменяется на 10 классов через `num_labels=10` и
-  `ignore_mismatched_sizes=True`.
-- Hugging Face DETR внутри использует Hungarian matching и DETR loss:
-  classification + L1 bbox + GIoU.
-- Для backbone используется отдельный learning rate `1e-5`, для остальных
-  параметров — `1e-4`.
-- Scheduler: `StepLR` с `lr_drop=10`.
-- Train preprocessing: resize по максимальной стороне и horizontal flip.
-- TensorBoard logs.
-- Checkpoints `last.pt` и `best.pt`.
-- Profiler trace.
-- `mAP` и `mAP50`; по умолчанию используется `pycocotools.COCOeval`.
-- Error analysis: classification errors, localization errors, false positives,
-  false negatives.
-
-## Локальный запуск
-
-```bash
-python --version
-pip install -r requirements.txt
-
-python prepare_coco_subset.py ^
-  --coco-root D:\datasets\coco ^
-  --out-root data/coco_10cls ^
-  --max-train-images 3000 ^
-  --max-val-images 500 ^
-  --min-train-instances-per-class 50 ^
-  --min-val-instances-per-class 10
-
-python -m src.train train ^
-  --train-images data/coco_10cls/train2017 ^
-  --train-annotations data/coco_10cls/annotations/instances_train2017_10cls.json ^
-  --val-images data/coco_10cls/val2017 ^
-  --val-annotations data/coco_10cls/annotations/instances_val2017_10cls.json ^
-  --epochs 20 ^
-  --batch-size 2 ^
-  --lr 1e-4 ^
-  --lr-backbone 1e-5 ^
-  --metric-score-threshold 0.0 ^
-  --profile
-```
-
-## Полный прогон в Kaggle
-
-Ниже команды именно для ячеек Kaggle Notebook, поэтому везде стоят `!`.
-Путь `COCO_ROOT` менять под Kaggle Dataset. 
-
-### 1. Проверить файлы датасета
+## Kaggle: подготовка проекта и COCO
 
 ```python
-!ls /kaggle/input
-!find /kaggle/input -maxdepth 3 -type f -name "instances_train2017.json" | head
-!find /kaggle/input -maxdepth 3 -type d -name "train2017" | head
-```
-
-### 2. Установить зависимости
-
-```python
+!git clone https://github.com/marritau/cv-hw3.git
+%cd cv-hw3
 !python --version
 !pip install -q -r requirements.txt
 ```
 
-Код рассчитан на Python `>=3.10`. Для загрузки `facebook/detr-resnet-50`
-в Kaggle должен быть включен Internet.
+COCO можно подключить через Kaggle `Add input`, но ниже полный вариант скачивания
+в notebook:
 
-### 3. Задать путь к COCO
-
-(пример)
 ```python
-COCO_ROOT = "/kaggle/input/coco-2017-dataset/coco2017"
+!mkdir -p /kaggle/working/coco
+!wget -q -P /kaggle/working/coco http://images.cocodataset.org/zips/train2017.zip
+!wget -q -P /kaggle/working/coco http://images.cocodataset.org/zips/val2017.zip
+!wget -q -P /kaggle/working/coco http://images.cocodataset.org/annotations/annotations_trainval2017.zip
+
+!unzip -q /kaggle/working/coco/train2017.zip -d /kaggle/working/coco
+!unzip -q /kaggle/working/coco/val2017.zip -d /kaggle/working/coco
+!unzip -q /kaggle/working/coco/annotations_trainval2017.zip -d /kaggle/working/coco
+
+COCO_ROOT = "/kaggle/working/coco"
 ```
 
-### 4. Собрать COCO-subset из 10 классов
+## HW2: DETR на COCO-subset
+
+### 1. Собрать subset из 10 классов
 
 ```python
 !python prepare_coco_subset.py \
@@ -104,9 +60,10 @@ COCO_ROOT = "/kaggle/input/coco-2017-dataset/coco2017"
   --link-mode copy
 ```
 
-Классы по умолчанию: `person,bicycle,car,motorcycle,bus,train,truck,traffic light,stop sign,dog`.
+Классы по умолчанию:
+`person,bicycle,car,motorcycle,bus,train,truck,traffic light,stop sign,dog`.
 
-### 5. Обучить модель
+### 2. Fine-tuning DETR
 
 ```python
 !python -m src.train train \
@@ -126,7 +83,7 @@ COCO_ROOT = "/kaggle/input/coco-2017-dataset/coco2017"
   --profile
 ```
 
-Для быстрого тестового запуска:
+Быстрый smoke-run:
 
 ```python
 !python -m src.train train \
@@ -143,14 +100,14 @@ COCO_ROOT = "/kaggle/input/coco-2017-dataset/coco2017"
   --profile
 ```
 
-### 6. Посмотреть TensorBoard
+### 3. TensorBoard
 
 ```python
 %load_ext tensorboard
 %tensorboard --logdir /kaggle/working/runs
 ```
 
-### 7. Посчитать mAP/mAP50
+### 4. Метрики, loss plot, error analysis
 
 ```python
 !python -m src.train eval \
@@ -163,19 +120,11 @@ COCO_ROOT = "/kaggle/input/coco-2017-dataset/coco2017"
   --num-workers 2 \
   --metric-backend coco \
   --metric-score-threshold 0.0
-```
 
-### 8. Построить график loss
-
-```python
 !python -m src.train plot \
   --metrics /kaggle/working/reports/metrics.csv \
   --output /kaggle/working/outputs/plots/losses.png
-```
 
-### 9. Сделать error analysis и визуализации
-
-```python
 !python -m src.train errors \
   --val-images /kaggle/working/data/coco_10cls/val2017 \
   --val-annotations /kaggle/working/data/coco_10cls/annotations/instances_val2017_10cls.json \
@@ -191,11 +140,97 @@ COCO_ROOT = "/kaggle/input/coco-2017-dataset/coco2017"
   --max-visuals 16
 ```
 
-### 10. Проверить, что все артефакты есть
+## HW2.5: Stable Diffusion + ControlNet synthetic data
+
+2.5 работает как классификационный ablation на object crops из того же
+COCO-subset: сначала создаются реальные crop-изображения объектов, затем для
+редких классов генерируется синтетика через ControlNet, потом обучается ResNet18
+без синтетики и с синтетикой.
+
+### 1. Выбрать редкие классы
 
 ```python
-!ls -R /kaggle/working/checkpoints
-!ls -R /kaggle/working/reports
-!ls -R /kaggle/working/profiler_traces | head
-!ls -R /kaggle/working/outputs | head -50
+!python -m src.synthetic_ablation select-rare \
+  --train-annotations /kaggle/working/data/coco_10cls/annotations/instances_train2017_10cls.json \
+  --num-classes 3 \
+  --output /kaggle/working/reports/rare_classes.json
 ```
+
+### 2. Сделать crop dataset для CNN
+
+```python
+!python -m src.synthetic_ablation make-crops \
+  --train-images /kaggle/working/data/coco_10cls/train2017 \
+  --train-annotations /kaggle/working/data/coco_10cls/annotations/instances_train2017_10cls.json \
+  --val-images /kaggle/working/data/coco_10cls/val2017 \
+  --val-annotations /kaggle/working/data/coco_10cls/annotations/instances_val2017_10cls.json \
+  --output-dir /kaggle/working/data/classification_crops \
+  --min-crop-size 24
+```
+
+### 3. Сгенерировать синтетику Stable Diffusion + ControlNet
+
+Для этой ячейки нужен включенный Internet и GPU. Если модель требует Hugging Face
+доступ, перед запуском выполняется login через токен.
+
+```python
+!python -m src.synthetic_ablation generate \
+  --rare-classes /kaggle/working/reports/rare_classes.json \
+  --crops-dir /kaggle/working/data/classification_crops/train \
+  --output-dir /kaggle/working/data/synthetic_controlnet \
+  --images-per-class 50 \
+  --resolution 512 \
+  --steps 25 \
+  --guidance-scale 7.5 \
+  --base-model runwayml/stable-diffusion-v1-5 \
+  --controlnet-model lllyasviel/sd-controlnet-canny \
+  --device cuda
+```
+
+Результаты генерации:
+
+- `/kaggle/working/data/synthetic_controlnet/manifest.csv`
+- `/kaggle/working/data/synthetic_controlnet/synthetic_examples.png`
+- class folders с синтетическими изображениями.
+
+### 4. Ablation: CNN без синтетики и с синтетикой
+
+```python
+!python -m src.synthetic_ablation ablation \
+  --real-train-dir /kaggle/working/data/classification_crops/train \
+  --val-dir /kaggle/working/data/classification_crops/val \
+  --synthetic-dir /kaggle/working/data/synthetic_controlnet \
+  --output-dir /kaggle/working/reports \
+  --epochs 5 \
+  --batch-size 32 \
+  --num-workers 2 \
+  --pretrained \
+  --device cuda
+```
+
+Результаты ablation:
+
+- `/kaggle/working/reports/synthetic_ablation.csv`
+- `/kaggle/working/reports/synthetic_ablation.json`
+
+## Артефакты для сдачи
+
+DETR:
+
+- `runs/` — TensorBoard logs.
+- `checkpoints/best.pt`, `checkpoints/last.pt`.
+- `profiler_traces/`.
+- `reports/metrics.csv`, `reports/eval_metrics.json`.
+- `outputs/plots/losses.png`.
+- `outputs/visualizations/`.
+- `outputs/error_analysis/errors.json`.
+
+Synthetic data:
+
+- `data/synthetic_controlnet/manifest.csv`.
+- `data/synthetic_controlnet/synthetic_examples.png`.
+- `reports/synthetic_ablation.csv`.
+- `reports/synthetic_ablation.json`.
+
+После полного запуска в README добавляются фактические значения `mAP/mAP50`,
+таблица ablation и краткие наблюдения по loss/error analysis.
